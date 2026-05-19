@@ -1,167 +1,267 @@
-# Telegram Affiliate Tracking Bot
+# Telegram Affiliate Bot
 
-A powerful Telegram bot with:
-
-- Deep-link tracking
-- SQLite database
-- Admin panel
-- Dynamic poster upload
-- Dynamic button text
-- Dynamic welcome message
-- Dynamic callback URL
-- Dynamic bot token
-- PM2 auto restart
-- User tracking system
+A production-grade Telegram bot for **CPI / CPA affiliate tracking** and channel-join automation. Captures click IDs from `/start` deep links, fires postbacks on channel joins, and approves join requests automatically.
 
 ---
 
-# Features
+## Features
 
-## User Flow
-
-User opens:
-
-https://t.me/YOUR_BOT?start=click_id_offer123
-
-Bot will:
-
-1. Save click_id
-2. Save user info
-3. Send welcome message
-4. Send poster
-5. Show button
-6. Trigger callback to your server
-
----
-
-# Technologies
-
-- Node.js
-- Telegraf.js
-- SQLite
-- Express
-- PM2
+- **Click ID tracking** — captures affiliate click IDs from `/start click_id_XXX` deep links
+- **Postback firing** — sends a GET request to your tracker on every channel join
+- **Auto-approve join requests** — no manual approval, scales to thousands of users
+- **Per-campaign deduplication** — same user across different campaigns = separate rows; same campaign = updated row
+- **Button-based admin panel** — full bot control via inline buttons, no editing code
+- **Multi-admin support** — add/remove admins on the fly
+- **MarkdownV2-safe** — usernames with special chars never break the bot
+- **Self-healing token** — invalid stored token? Auto-recovers from env or hardcoded default
+- **WAL-mode SQLite** — fast, concurrent-safe storage with indexes
+- **Settings cache** — DB hit once per setting, then served from memory
+- **Graceful shutdown** — clean exit on SIGINT/SIGTERM
+- **Health check endpoint** — `/health` for uptime monitors
+- **Built-in stats** — total users + new users today
 
 ---
 
-# Installation
+## Stack
 
-## Clone
-
-git clone YOUR_REPO
-
-cd telegram-affiliate-bot
-
-## Install packages
-
-npm install
+- **Node.js** 18+
+- **Telegraf** 4.x
+- **Express**
+- **SQLite3**
+- **Axios**
+- **dotenv**
 
 ---
 
-# Start Bot
+## Setup
 
-node index.js
+### 1. Install
 
----
+```bash
+npm install telegraf express sqlite3 axios dotenv
+```
 
-# PM2 Setup
+### 2. Configure
 
-Install PM2:
+Copy `.env.example` to `.env` and fill in:
 
+```env
+BOT_TOKEN=123456789:AAAA-your-real-token-here
+PORT=3000
+DB_PATH=./database.db
+```
+
+Get your bot token from [@BotFather](https://t.me/BotFather).
+
+### 3. Run
+
+**Development (auto-reload):**
+```bash
+npx nodemon index.js
+```
+
+**Production (with PM2):**
+```bash
 npm install -g pm2
-
-Run:
-
 pm2 start index.js --name tg-bot
-
-Save:
-
 pm2 save
-
-Auto-start:
-
 pm2 startup
+```
+
+Expected log on success:
+```
+[INFO ] Using bot token from: BOT_TOKEN env
+[INFO ] Logged in as @yourbot
+[INFO ] HTTP listening on :3000
+[INFO ] Bot started ✅
+```
 
 ---
 
-# Admin Panel
+## Commands
 
-Use:
+### Public
 
-/admin
+| Command | Description |
+|---------|-------------|
+| `/start` | Entry point. Captures `click_id_XXX` payload, sends welcome + join button |
+| `/id` | Shows the user their Telegram ID and username |
 
-Admins are defined inside:
+### Admin-only
 
-index.js
+| Command | Description |
+|---------|-------------|
+| `/admin` | Opens the full settings panel |
+| `/stats` | Shows total users + new users today |
+| `/cancel` | Cancels any pending admin action |
 
-Example:
+### Register with BotFather
 
-const ADMINS = [
-    "yourusername"
-];
+Send `/setcommands` to [@BotFather](https://t.me/BotFather), pick your bot, paste:
 
----
-
-# Deep Link Example
-
-https://t.me/YOUR_BOT?start=click_id_offer123
-
----
-
-# Database
-
-SQLite database file:
-
-database.db
-
-No external database required.
+```
+start - Get started
+id - Show my Telegram ID
+admin - Open admin panel
+stats - View user stats
+cancel - Cancel current action
+```
 
 ---
 
-# Editable Settings
+## Admin Panel
 
-Admins can change:
+Run `/admin` (must be in the admins list) and you get button access to:
 
-- Welcome message
-- Poster image
-- Poster caption
-- Button text
-- Callback URL
-- Bot token
+| Button | Purpose |
+|--------|---------|
+| ✏️ Welcome | Set the welcome message. Use `{name}` for first name |
+| 🖼 Caption | Set the poster caption |
+| 🔘 Button | Set the join button label |
+| 🔗 Btn URL | Set the join button destination URL |
+| 🌐 Callback | Set your postback/tracker URL |
+| 📸 Poster | Upload a poster image (send as photo) |
+| 👑 Admins | Add or remove admins |
+| 🤖 Token | Change the bot token (bot will restart) |
+| 📊 Stats | Total + today's user count |
 
----
-
-# Bot Token Change
-
-When token changes:
-
-1. Bot saves new token
-2. App exits
-3. PM2 restarts bot automatically
+Default admins are set in `CONFIG.DEFAULT_ADMINS` inside `index.js`.
 
 ---
 
-# Callback Payload
+## How the Affiliate Flow Works
 
-Example callback sent to your server:
+1. **User clicks an affiliate link:**
+   ```
+   https://t.me/yourbot?start=click_id_ABC123
+   ```
 
-{
-  "telegram_id": 123456,
-  "username": "john",
-  "first_name": "John",
-  "click_id": "offer123"
-}
+2. **Bot captures** the click ID and stores `{telegram_id, click_id, username, first_name}` in SQLite.
+
+3. **Bot shows** the welcome message + poster + join button.
+
+4. **User requests to join** the channel via the button.
+
+5. **Bot fires a GET request** to your callback URL:
+   ```
+   https://your-tracker.com/callback
+     ?telegram_id=123456789
+     &username=user_handle
+     &first_name=First
+     &click_id=ABC123
+     &channel_id=-1001234567890
+     &channel_title=Your+Channel
+   ```
+
+6. **Bot auto-approves** the join request — user is in the channel.
+
+7. **Your tracker** records the conversion against the click ID.
 
 ---
 
-# Port
+## Deployment
 
-Default:
+### PM2 (VPS — recommended)
 
-3000
+```bash
+pm2 start index.js --name tg-bot
+pm2 logs tg-bot
+pm2 restart tg-bot
+```
+
+### Render / Railway / Fly.io
+
+- Set `BOT_TOKEN` in the platform's env var settings
+- Use the `/health` endpoint for health checks
+- The bot uses long polling, no webhook config needed
+
+### Docker
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+EXPOSE 3000
+CMD ["node", "index.js"]
+```
 
 ---
 
-# License
+## Database
 
-MIT
+SQLite file at `./database.db` (or wherever `DB_PATH` points). Three tables:
+
+- **`settings`** — key/value config (welcome message, URLs, token, etc.)
+- **`users`** — every `/start` with `(telegram_id, click_id, username, first_name, joined_at)`
+- **`admins`** — list of Telegram usernames with admin access
+
+**Reset everything:**
+```bash
+rm database.db
+```
+
+The bot recreates tables and seeds defaults on next start.
+
+---
+
+## Bot Permissions
+
+Inside your Telegram channel, the bot needs:
+
+- **Admin** rights
+- **Invite users via link** permission
+- **Manage join requests** permission
+
+Without these, `approveChatJoinRequest` will silently fail.
+
+---
+
+## Troubleshooting
+
+**`Invalid or missing bot token`**
+- `BOT_TOKEN` env var not set, or `.env` not loaded
+- Run `npm install dotenv` and check `.env` is in the same folder as `index.js`
+- Try `rm database.db` if you previously ran with an empty token
+
+**Bot logs in but doesn't reply to `/start`**
+- Check for `Bot started ✅` in logs
+- Run `/setprivacy` on BotFather → `Disable` if needed
+
+**Join requests not getting approved**
+- Bot must be admin in the channel with "Manage join requests" permission
+- Channel must have **join requests** enabled (Channel Settings → Channel Type → Approve new members)
+
+**Postback not firing**
+- Check the URL in `/admin` → `🌐 Callback`
+- Look for `CALLBACK FAIL` lines in logs — usually a timeout or 4xx/5xx from your tracker
+- The 10s timeout can be raised in `CONFIG.CALLBACK_TIMEOUT`
+
+**Markdown errors in welcome**
+- The bot uses MarkdownV2 — escape special chars with `\` in your welcome message
+- Or keep messages plain text, no special chars
+
+---
+
+## Security Notes
+
+- Never commit your `.env` file. Add to `.gitignore`:
+  ```
+  .env
+  database.db
+  node_modules/
+  ```
+- Don't hardcode the token in `CONFIG.DEFAULT_SETTINGS` for production — use env vars only
+- Admin usernames are case-insensitive, but usernames can be reassigned on Telegram — review your admin list periodically
+
+---
+
+## Roadmap
+
+- [ ] `/broadcast` — send a message to all users
+- [ ] `/users` — export user list as CSV
+- [ ] `/ban` and `/unban`
+- [ ] Webhook mode
+- [ ] Per-campaign analytics (clicks vs joins vs conversions)
+- [ ] Multi-channel support

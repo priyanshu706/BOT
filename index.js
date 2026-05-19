@@ -1,9 +1,7 @@
 "use strict";
 
-/**
- * Telegram Affiliate / CPI Bot — Production Build
- * Brand Motive Marketing (BMM)
- */
+
+ // Telegram Affiliate / CPI Bot — Production Build
 
 try { require("dotenv").config(); } catch (_) { }
 
