@@ -1,35 +1,37 @@
 "use strict";
 
+/**
+ * Telegram Affiliate / CPI Bot — Production Build
+ */
 
- // Telegram Affiliate / CPI Bot — Production Build
-
-try { require("dotenv").config(); } catch (_) { }
+try { require("dotenv").config(); } catch (_) {}
 
 const { Telegraf, Markup } = require("telegraf");
 const express = require("express");
 const sqlite3 = require("sqlite3").verbose();
-const axios = require("axios");
-const path = require("path");
+const axios   = require("axios");
+const path    = require("path");
 
 
 /* ─────────────── CONFIG ─────────────── */
 
 const CONFIG = {
-    PORT: parseInt(process.env.PORT || "3000", 10),
-    DB_PATH: process.env.DB_PATH || path.join(__dirname, "database.db"),
+    PORT:             parseInt(process.env.PORT || "3000", 10),
+    DB_PATH:          process.env.DB_PATH || path.join(__dirname, "database.db"),
     CALLBACK_TIMEOUT: 10_000,
-    STATE_TIMEOUT: 5 * 60 * 1000,
+    STATE_TIMEOUT:    5 * 60 * 1000,
+    LOG_LIMIT:        20,    // how many entries /logs shows
 
     DEFAULT_ADMINS: ["BaapVector", "Shesh_Nag7", "govindyt001k"],
 
     DEFAULT_SETTINGS: {
-        bot_token: process.env.BOT_TOKEN || "8649130059:AAGgMVNtnQHWzas_SsCR14N996z5v5KSDYo",
+        bot_token:       process.env.BOT_TOKEN || "8649130059:AAGgMVNtnQHWzas_SsCR14N996z5v5KSDYo",
         welcome_message: "Welcome {name}!",
-        poster_caption: "Join our official channel below.",
-        button_text: "🚀 Join Channel",
-        button_url: "https://t.me/yourchannel",
-        redirect_url: "https://yourdomain.com/callback",
-        poster_file_id: ""
+        poster_caption:  "Join our official channel below.",
+        button_text:     "🚀 Join Channel",
+        button_url:      "https://t.me/yourchannel",
+        redirect_url:    "https://yourdomain.com/callback",
+        poster_file_id:  ""
     }
 };
 
@@ -37,8 +39,8 @@ const CONFIG = {
 /* ─────────────── LOGGER ─────────────── */
 
 const log = {
-    info: (...a) => console.log(new Date().toISOString(), "[INFO ]", ...a),
-    warn: (...a) => console.warn(new Date().toISOString(), "[WARN ]", ...a),
+    info:  (...a) => console.log  (new Date().toISOString(), "[INFO ]", ...a),
+    warn:  (...a) => console.warn (new Date().toISOString(), "[WARN ]", ...a),
     error: (...a) => console.error(new Date().toISOString(), "[ERROR]", ...a)
 };
 
@@ -56,6 +58,11 @@ const isValidUrl = (s) => {
 
 const isValidBotToken = (t) => /^\d+:[A-Za-z0-9_-]{30,}$/.test(t || "");
 const isValidUsername = (u) => /^[A-Za-z0-9_]{3,32}$/.test(u || "");
+
+const truncate = (s, n = 60) => {
+    s = String(s || "");
+    return s.length > n ? s.slice(0, n) + "…" : s;
+};
 
 
 /* ─────────────── DATABASE ─────────────── */
@@ -109,6 +116,18 @@ async function initDb() {
         )
     `);
 
+    await dbRun(`
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_username TEXT,
+            admin_id       TEXT,
+            action         TEXT,
+            details        TEXT,
+            timestamp      TEXT
+        )
+    `);
+    await dbRun(`CREATE INDEX IF NOT EXISTS idx_admin_logs_ts ON admin_logs(timestamp)`);
+
     for (const admin of CONFIG.DEFAULT_ADMINS) {
         await dbRun(`INSERT OR IGNORE INTO admins(username) VALUES (?)`, [admin]);
     }
@@ -142,23 +161,53 @@ async function isAdmin(username) {
     return !!row;
 }
 
+async function logAdmin(ctx, action, details = "") {
+    const username = ctx?.from?.username || "";
+    const id = ctx?.from?.id ? String(ctx.from.id) : "";
+    try {
+        await dbRun(
+            `INSERT INTO admin_logs(admin_username, admin_id, action, details, timestamp)
+             VALUES (?, ?, ?, ?, ?)`,
+            [username, id, action, details, new Date().toISOString()]
+        );
+    } catch (e) {
+        log.error("logAdmin failed:", e.message);
+    }
+    log.info(`ADMIN | @${username || "?"} | ${action}${details ? ` | ${details}` : ""}`);
+}
 
-/* ─────────────── TOKEN RESOLUTION (self-healing) ─────────────── */
+
+/* ─────────────── TOKEN RESOLUTION (self-healing + live verification) ─────────────── */
+
+async function verifyToken(token) {
+    // Live test the token by calling getMe. Returns the bot info on success, throws on failure.
+    const probe = new Telegraf(token);
+    return await probe.telegram.getMe();
+}
 
 async function resolveBotToken() {
-    // Priority: env var > stored DB value > hardcoded default
     const candidates = [
-        { source: "BOT_TOKEN env", value: process.env.BOT_TOKEN },
-        { source: "database", value: await getSetting("bot_token") },
+        { source: "BOT_TOKEN env",     value: process.env.BOT_TOKEN },
+        { source: "database",          value: await getSetting("bot_token") },
         { source: "hardcoded default", value: CONFIG.DEFAULT_SETTINGS.bot_token }
     ];
 
     for (const c of candidates) {
-        if (isValidBotToken(c.value)) {
-            log.info(`Using bot token from: ${c.source}`);
-            // Persist so DB always has the working token
-            await setSetting("bot_token", c.value);
-            return c.value;
+        if (!isValidBotToken(c.value)) continue;
+
+        try {
+            const me = await verifyToken(c.value);
+            log.info(`Using bot token from: ${c.source} (@${me.username})`);
+            await setSetting("bot_token", c.value);  // persist working token
+            return { token: c.value, me };
+        } catch (e) {
+            log.warn(`Token from ${c.source} failed live check: ${e.message}; trying next…`);
+            // Clear bad DB token so next boot won't loop on it
+            if (c.source === "database") {
+                await setSetting("bot_token", "");
+                settingsCache.delete("bot_token");
+                log.warn("Cleared invalid token from database");
+            }
         }
     }
     return null;
@@ -188,11 +237,11 @@ function clearState(userId) {
 /* ─────────────── ADMIN PANEL ─────────────── */
 
 const ADMIN_PANEL = Markup.inlineKeyboard([
-    [Markup.button.callback("✏️ Welcome", "set_welcome"), Markup.button.callback("🖼 Caption", "set_caption")],
-    [Markup.button.callback("🔘 Button", "set_button"), Markup.button.callback("🔗 Btn URL", "set_button_url")],
-    [Markup.button.callback("🌐 Callback", "set_url"), Markup.button.callback("📸 Poster", "set_poster")],
-    [Markup.button.callback("👑 Admins", "manage_admins"), Markup.button.callback("🤖 Token", "set_token")],
-    [Markup.button.callback("📊 Stats", "show_stats")]
+    [Markup.button.callback("✏️ Welcome",  "set_welcome"),    Markup.button.callback("🖼 Caption", "set_caption")],
+    [Markup.button.callback("🔘 Button",   "set_button"),     Markup.button.callback("🔗 Btn URL", "set_button_url")],
+    [Markup.button.callback("🌐 Callback", "set_url"),        Markup.button.callback("📸 Poster",  "set_poster")],
+    [Markup.button.callback("👑 Admins",   "manage_admins"),  Markup.button.callback("🤖 Token",   "set_token")],
+    [Markup.button.callback("📊 Stats",    "show_stats"),     Markup.button.callback("📜 Logs",    "show_logs")]
 ]);
 
 async function showAdminPanel(ctx, edit = false) {
@@ -200,9 +249,26 @@ async function showAdminPanel(ctx, edit = false) {
     const opts = { parse_mode: "MarkdownV2", ...ADMIN_PANEL };
 
     if (edit) {
-        try { return await ctx.editMessageText(text, opts); } catch (_) { }
+        try { return await ctx.editMessageText(text, opts); } catch (_) {}
     }
     await ctx.reply(text, opts);
+}
+
+async function renderLogs() {
+    const rows = await dbAll(
+        `SELECT * FROM admin_logs ORDER BY id DESC LIMIT ?`,
+        [CONFIG.LOG_LIMIT]
+    );
+    if (!rows.length) return "📜 *Admin Activity*\n\n_No activity yet._";
+
+    const lines = rows.map((r) => {
+        const ts = (r.timestamp || "").replace("T", " ").slice(0, 19);
+        const who = r.admin_username ? `@${r.admin_username}` : `id:${r.admin_id || "?"}`;
+        const det = r.details ? ` — ${truncate(r.details, 50)}` : "";
+        return `\`${ts}\` ${who} → *${r.action}*${det}`;
+    });
+
+    return `📜 *Recent Admin Activity* \\(last ${rows.length}\\)\n\n${lines.join("\n")}`;
 }
 
 
@@ -211,26 +277,26 @@ async function showAdminPanel(ctx, edit = false) {
 async function startBot() {
     await initDb();
 
-    const token = await resolveBotToken();
-    if (!token) {
+    const resolved = await resolveBotToken();
+    if (!resolved) {
         log.error("No valid bot token found anywhere.");
         log.error("Fix: set BOT_TOKEN env var, or edit CONFIG.DEFAULT_SETTINGS.bot_token.");
         process.exit(1);
     }
 
-    const bot = new Telegraf(token, { handlerTimeout: 90_000 });
-    const me = await bot.telegram.getMe();
+    const bot = new Telegraf(resolved.token, { handlerTimeout: 90_000 });
+    const me  = resolved.me;
     log.info(`Logged in as @${me.username}`);
 
 
     /* ── /start ── */
     bot.start(async (ctx) => {
         try {
-            const payload = ctx.startPayload || "";
-            const clickId = payload.startsWith("click_id_") ? payload.slice("click_id_".length) : "";
-            const tgId = String(ctx.from.id);
-            const username = ctx.from.username || "";
-            const fname = ctx.from.first_name || "";
+            const payload  = ctx.startPayload || "";
+            const clickId  = payload.startsWith("click_id_") ? payload.slice("click_id_".length) : "";
+            const tgId     = String(ctx.from.id);
+            const username = ctx.from.username   || "";
+            const fname    = ctx.from.first_name || "";
 
             log.info(`START | id=${tgId} @${username || "no_username"} click_id=${clickId || "none"}`);
 
@@ -273,7 +339,7 @@ async function startBot() {
     /* ── chat_join_request → postback → approve ── */
     bot.on("chat_join_request", async (ctx) => {
         try {
-            const req = ctx.update.chat_join_request;
+            const req  = ctx.update.chat_join_request;
             const user = req.from;
 
             const row = await dbGet(
@@ -284,12 +350,12 @@ async function startBot() {
             const redirectUrl = await getSetting("redirect_url");
             if (row && redirectUrl) {
                 const params = new URLSearchParams({
-                    telegram_id: row.telegram_id || "",
-                    username: row.username || "",
-                    first_name: row.first_name || "",
-                    click_id: row.click_id || "",
-                    channel_id: String(req.chat.id),
-                    channel_title: req.chat.title || ""
+                    telegram_id:   row.telegram_id   || "",
+                    username:      row.username      || "",
+                    first_name:    row.first_name    || "",
+                    click_id:      row.click_id      || "",
+                    channel_id:    String(req.chat.id),
+                    channel_title: req.chat.title    || ""
                 });
                 const sep = redirectUrl.includes("?") ? "&" : "?";
                 const callbackUrl = `${redirectUrl}${sep}${params.toString()}`;
@@ -334,6 +400,12 @@ async function startBot() {
         );
     });
 
+    bot.command("logs", async (ctx) => {
+        if (!(await isAdmin(ctx.from.username))) return;
+        const text = await renderLogs();
+        await ctx.reply(text, { parse_mode: "MarkdownV2" });
+    });
+
     bot.command("cancel", async (ctx) => {
         clearState(ctx.from.id);
         await ctx.reply("✅ Cancelled.");
@@ -349,13 +421,13 @@ async function startBot() {
 
     /* ── Admin prompt buttons ── */
     const PROMPTS = {
-        set_welcome: { state: "waiting_welcome", text: "Send the new *welcome message*\\.\nUse `{name}` for first name\\." },
-        set_caption: { state: "waiting_caption", text: "Send the new *poster caption*\\." },
-        set_button: { state: "waiting_button", text: "Send the new *button text* \\(max 64 chars\\)\\." },
+        set_welcome:    { state: "waiting_welcome",    text: "Send the new *welcome message*\\.\nUse `{name}` for first name\\." },
+        set_caption:    { state: "waiting_caption",    text: "Send the new *poster caption*\\." },
+        set_button:     { state: "waiting_button",     text: "Send the new *button text* \\(max 64 chars\\)\\." },
         set_button_url: { state: "waiting_button_url", text: "Send the new *button URL* \\(must start with https://\\)\\." },
-        set_url: { state: "waiting_url", text: "Send the new *callback/postback URL*\\." },
-        set_token: { state: "waiting_token", text: "Send the new *bot token*\\. Bot will restart\\." },
-        set_poster: { state: "waiting_poster", text: "Send the new *poster image* as a photo\\." }
+        set_url:        { state: "waiting_url",        text: "Send the new *callback/postback URL*\\." },
+        set_token:      { state: "waiting_token",      text: "Send the new *bot token*\\.\nIt will be live\\-tested before saving\\." },
+        set_poster:     { state: "waiting_poster",     text: "Send the new *poster image* as a photo\\." }
     };
 
     for (const [action, data] of Object.entries(PROMPTS)) {
@@ -386,6 +458,23 @@ async function startBot() {
     });
 
 
+    /* ── Logs button ── */
+    bot.action("show_logs", async (ctx) => {
+        if (!(await isAdmin(ctx.from.username))) return ctx.answerCbQuery("Unauthorized");
+        const text = await renderLogs();
+        await ctx.answerCbQuery();
+        try {
+            await ctx.editMessageText(text, {
+                parse_mode: "MarkdownV2",
+                ...Markup.inlineKeyboard([[Markup.button.callback("⬅️ Back", "back_admin")]])
+            });
+        } catch (e) {
+            // editMessageText fails if message has photo or content is too long
+            await ctx.reply(text, { parse_mode: "MarkdownV2" });
+        }
+    });
+
+
     /* ── Manage admins ── */
     bot.action("manage_admins", async (ctx) => {
         if (!(await isAdmin(ctx.from.username))) return ctx.answerCbQuery("Unauthorized");
@@ -398,7 +487,7 @@ async function startBot() {
             buttons.push(row);
         }
         buttons.push([Markup.button.callback("➕ Add Admin", "add_admin")]);
-        buttons.push([Markup.button.callback("⬅️ Back", "back_admin")]);
+        buttons.push([Markup.button.callback("⬅️ Back",      "back_admin")]);
 
         await ctx.answerCbQuery();
         try {
@@ -438,7 +527,7 @@ async function startBot() {
             reply_markup: {
                 inline_keyboard: [
                     [Markup.button.callback("❌ Remove Admin", `remove_${username}`)],
-                    [Markup.button.callback("⬅️ Back", "manage_admins")]
+                    [Markup.button.callback("⬅️ Back",        "manage_admins")]
                 ]
             }
         });
@@ -454,6 +543,8 @@ async function startBot() {
         }
 
         await dbRun(`DELETE FROM admins WHERE username=? COLLATE NOCASE`, [username]);
+        await logAdmin(ctx, "ADMIN_REMOVE", `@${username}`);
+
         await ctx.answerCbQuery("Admin removed");
         await ctx.editMessageText(`❌ Removed @${username}`, {
             reply_markup: { inline_keyboard: [[Markup.button.callback("⬅️ Back", "manage_admins")]] }
@@ -472,6 +563,7 @@ async function startBot() {
                 if (!ctx.message.photo) return ctx.reply("Please send an image as a *photo*.", { parse_mode: "Markdown" });
                 const biggest = ctx.message.photo[ctx.message.photo.length - 1];
                 await setSetting("poster_file_id", biggest.file_id);
+                await logAdmin(ctx, "POSTER_UPDATE", `file_id=${truncate(biggest.file_id, 20)}`);
                 clearState(ctx.from.id);
                 return ctx.reply("✅ Poster updated.");
             }
@@ -483,37 +575,56 @@ async function startBot() {
             switch (state) {
                 case "waiting_welcome":
                     await setSetting("welcome_message", text);
+                    await logAdmin(ctx, "WELCOME_UPDATE", truncate(text));
                     break;
 
                 case "waiting_caption":
                     await setSetting("poster_caption", text);
+                    await logAdmin(ctx, "CAPTION_UPDATE", truncate(text));
                     break;
 
                 case "waiting_button":
                     if (text.length > 64) return ctx.reply("❌ Button text too long (max 64 chars).");
                     await setSetting("button_text", text);
+                    await logAdmin(ctx, "BUTTON_TEXT_UPDATE", text);
                     break;
 
                 case "waiting_button_url":
                     if (!isValidUrl(text)) return ctx.reply("❌ Invalid URL. Must start with http(s)://");
                     await setSetting("button_url", text);
+                    await logAdmin(ctx, "BUTTON_URL_UPDATE", text);
                     break;
 
                 case "waiting_url":
                     if (!isValidUrl(text)) return ctx.reply("❌ Invalid URL. Must start with http(s)://");
                     await setSetting("redirect_url", text);
+                    await logAdmin(ctx, "CALLBACK_URL_UPDATE", text);
                     break;
 
-                case "waiting_token":
-                    if (!isValidBotToken(text)) return ctx.reply("❌ Invalid bot token format.");
+                case "waiting_token": {
+                    if (!isValidBotToken(text)) {
+                        return ctx.reply("❌ Invalid bot token format.");
+                    }
+                    // Live-test the new token BEFORE saving — prevents bricking the bot.
+                    await ctx.reply("🔍 Verifying token with Telegram…");
+                    let newMe;
+                    try {
+                        newMe = await verifyToken(text);
+                    } catch (e) {
+                        return ctx.reply(`❌ Token rejected by Telegram: \`${e.message}\`\n\nNothing changed.`,
+                            { parse_mode: "Markdown" });
+                    }
+
                     await setSetting("bot_token", text);
+                    await logAdmin(ctx, "TOKEN_UPDATE", `@${newMe.username}`);
                     clearState(ctx.from.id);
                     await ctx.reply(
-                        "✅ Token saved. Restarting…\n\n_Make sure PM2/systemd auto-restarts on exit._",
+                        `✅ Token verified for @${newMe.username}. Restarting…\n\n_Make sure PM2/systemd auto-restarts on exit._`,
                         { parse_mode: "Markdown" }
                     );
                     setTimeout(() => process.exit(0), 500);
                     return;
+                }
 
                 case "waiting_add_admin": {
                     const clean = text.replace(/^@/, "").trim();
@@ -529,6 +640,7 @@ async function startBot() {
                         return ctx.reply("⚠️ Admin already exists.");
                     }
                     await dbRun(`INSERT INTO admins(username) VALUES (?)`, [clean]);
+                    await logAdmin(ctx, "ADMIN_ADD", `@${clean}`);
                     clearState(ctx.from.id);
                     return ctx.reply(`✅ Added @${clean}`);
                 }
@@ -553,7 +665,7 @@ async function startBot() {
     const app = express();
     app.use(express.json());
 
-    app.get("/", (_req, res) => res.send("Bot running"));
+    app.get("/",       (_req, res) => res.send("Bot running"));
     app.get("/health", async (_req, res) => {
         try {
             await dbGet(`SELECT 1`);
@@ -572,16 +684,16 @@ async function startBot() {
     /* ── Graceful shutdown ── */
     const shutdown = (signal) => {
         log.info(`Received ${signal}, shutting down…`);
-        try { bot.stop(signal); } catch (_) { }
+        try { bot.stop(signal); } catch (_) {}
         server.close();
-        try { db.close(); } catch (_) { }
+        try { db.close(); } catch (_) {}
         setTimeout(() => process.exit(0), 1500);
     };
 
-    process.once("SIGINT", () => shutdown("SIGINT"));
+    process.once("SIGINT",  () => shutdown("SIGINT"));
     process.once("SIGTERM", () => shutdown("SIGTERM"));
     process.on("unhandledRejection", (r) => log.error("Unhandled rejection:", r));
-    process.on("uncaughtException", (e) => log.error("Uncaught exception:", e.message));
+    process.on("uncaughtException",  (e) => log.error("Uncaught exception:",  e.message));
 }
 
 
